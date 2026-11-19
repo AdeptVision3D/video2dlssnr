@@ -1203,6 +1203,11 @@ int RunNeuralRendering(const std::string& dllDir, int adapter, const std::string
     namespace fs = std::filesystem;
     // Images are SDR: DLSS SR runs in its LDR mode and the model is shown sRGB.
     const bool hdr = false;
+    // adept-dlss patch: --nr-detail 0 means "the composite is the original untouched" (see
+    // Composite: out = orig + (...) * 0), so the model's output is never used. Skip the NR
+    // feature entirely: no create/evaluate/readback, no forwarder, and no NR size limit
+    // (~47 MP of output). The result is the DLSS-upscaled image (or the input at scale 1).
+    const bool skipNr = detail <= 0.0f;
     using Clock = std::chrono::steady_clock;
     auto ms = [](Clock::time_point a, Clock::time_point b) {
         return std::chrono::duration<double, std::milli>(b - a).count();
@@ -1251,12 +1256,13 @@ int RunNeuralRendering(const std::string& dllDir, int adapter, const std::string
     }
 
     ForwarderApi fwd;
-    if (!fwd.Load()) {
+    if (!skipNr && !fwd.Load()) {
         LogErr("could not load forwarder %s (err %lu)", Widen2Narrow(fwd.path).c_str(),
                GetLastError());
         NVSDK_NGX_D3D12_DestroyParameters(nrParams);
         return 1;
     }
+    if (skipNr) LogInfo("detail 0: Neural Rendering skipped (DLSS Super Resolution only)");
 
     fs::create_directories(Narrow2Widen(outDir), ec);
 
@@ -1315,6 +1321,10 @@ int RunNeuralRendering(const std::string& dllDir, int adapter, const std::string
         ImageF work = isUpscale ? UpscaleTo(gpu, ngx, srCache, img, tW, tH, hdr, srPreset) : img;
         tUpscale += ms(t0, Clock::now());
 
+        ImageF result;
+        if (skipNr) {
+            result = std::move(work);
+        } else {  // adept-dlss: the NR path below is unchanged, only wrapped in this else
         t0 = Clock::now();
         if (feature == nullptr || tW != curOW || tH != curOH) {
             if (feature) {
@@ -1405,8 +1415,9 @@ int RunNeuralRendering(const std::string& dllDir, int adapter, const std::string
         t0 = Clock::now();
         for (size_t i = 0; i < tpix; ++i)
             for (int c = 0; c < 3; ++c) nrPx[i * 4 + c] = SrgbToLinear(nrPx[i * 4 + c]);
-        ImageF result = Composite(work, nrPx, detail, colour);
+        result = Composite(work, nrPx, detail, colour);
         tCompose += ms(t0, Clock::now());
+        }  // end of the NR path
 
         const std::string stem = Widen2Narrow(fs::path(Narrow2Widen(imgPath)).filename().wstring());
         const std::string base = outDir + "/" + stem;
