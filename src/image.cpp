@@ -226,6 +226,22 @@ static std::vector<uint8_t> EncodeSrgb8(const ImageF& img) {
 void SavePng8(const std::string& path, const ImageF& img) {
     if (img.empty()) throw ToolError("SavePng8: empty image");
     const std::vector<uint8_t> bytes = EncodeSrgb8(img);
+    // adept: fast PNG encode (level 1 instead of stb's default 8) and RGB when alpha is opaque
+    stbi_write_png_compression_level = 1;
+    bool opaque = true;
+    for (size_t i = 0; i < img.pixels() && opaque; ++i) opaque = bytes[i * 4 + 3] == 255;
+    if (opaque) {
+        std::vector<uint8_t> rgb(img.pixels() * 3);
+        for (size_t i = 0; i < img.pixels(); ++i) {
+            rgb[i * 3] = bytes[i * 4];
+            rgb[i * 3 + 1] = bytes[i * 4 + 1];
+            rgb[i * 3 + 2] = bytes[i * 4 + 2];
+        }
+        if (!stbi_write_png(path.c_str(), img.w, img.h, 3, rgb.data(), img.w * 3)) {
+            throw ToolError("cannot write '" + path + "'");
+        }
+        return;
+    }
     if (!stbi_write_png(path.c_str(), img.w, img.h, 4, bytes.data(), img.w * 4)) {
         throw ToolError("cannot write '" + path + "'");
     }
