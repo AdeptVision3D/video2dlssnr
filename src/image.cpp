@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 
@@ -223,8 +224,15 @@ static std::vector<uint8_t> EncodeSrgb8(const ImageF& img) {
     return out;
 }
 
+static void SavePng8Fast(const std::string& path, const ImageF& img);
+
 void SavePng8(const std::string& path, const ImageF& img) {
     if (img.empty()) throw ToolError("SavePng8: empty image");
+    // adept: ADEPT_FAST_PNG=1 -> uncompressed 8-bit RGB PNG (intermediate files for tile_upscale.py)
+    if (const char* fp = std::getenv("ADEPT_FAST_PNG"); fp && fp[0] == '1') {
+        SavePng8Fast(path, img);
+        return;
+    }
     const std::vector<uint8_t> bytes = EncodeSrgb8(img);
     // adept: fast PNG encode (level 1 instead of stb's default 8) and RGB when alpha is opaque
     stbi_write_png_compression_level = 1;
@@ -351,6 +359,70 @@ void SavePng16(const std::string& path, const ImageF& img) {
     PushChunk(file, "IDAT", z);
     PushChunk(file, "IEND", {});
 
+    FILE* f = nullptr;
+    if (fopen_s(&f, path.c_str(), "wb") != 0 || !f) throw ToolError("cannot write '" + path + "'");
+    fwrite(file.data(), 1, file.size(), f);
+    fclose(f);
+}
+
+// adept: uncompressed (stored deflate) 8-bit RGB PNG, filter 0. Large file, very fast to write.
+static void SavePng8Fast(const std::string& path, const ImageF& img) {
+    const int w = img.w, h = img.h;
+    const size_t rowBytes = 1 + static_cast<size_t>(w) * 3;
+    const size_t rawSize = rowBytes * static_cast<size_t>(h);
+    std::vector<uint8_t> raw(rawSize);
+    for (int y = 0; y < h; ++y) {
+        uint8_t* r = raw.data() + rowBytes * static_cast<size_t>(y);
+        r[0] = 0;
+        const float* px = img.px.data() + static_cast<size_t>(y) * w * 4;
+        for (int x = 0; x < w; ++x) {
+            for (int c = 0; c < 3; ++c) {
+                const float v = LinearToSrgb(px[x * 4 + c]);
+                r[1 + x * 3 + c] = static_cast<uint8_t>(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f);
+            }
+        }
+    }
+    std::vector<uint8_t> file;
+    file.reserve(rawSize + rawSize / 65535 * 5 + 1024);
+    const uint8_t sig[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+    file.insert(file.end(), sig, sig + 8);
+    std::vector<uint8_t> ihdr;
+    PushBE32(ihdr, static_cast<uint32_t>(w));
+    PushBE32(ihdr, static_cast<uint32_t>(h));
+    ihdr.push_back(8);
+    ihdr.push_back(2);  // truecolour
+    ihdr.push_back(0);
+    ihdr.push_back(0);
+    ihdr.push_back(0);
+    PushChunk(file, "IHDR", ihdr);
+
+    std::vector<uint8_t> z;
+    z.reserve(rawSize + rawSize / 65535 * 5 + 16);
+    z.push_back(0x78);
+    z.push_back(0x01);
+    size_t off = 0;
+    uint64_t a = 1, b = 0;
+    do {
+        const size_t n = std::min<size_t>(65535, rawSize - off);
+        const bool last = (off + n >= rawSize);
+        z.push_back(last ? 1 : 0);
+        z.push_back(static_cast<uint8_t>(n & 0xFFu));
+        z.push_back(static_cast<uint8_t>((n >> 8) & 0xFFu));
+        const uint16_t nn = static_cast<uint16_t>(~n);
+        z.push_back(static_cast<uint8_t>(nn & 0xFFu));
+        z.push_back(static_cast<uint8_t>((nn >> 8) & 0xFFu));
+        z.insert(z.end(), raw.begin() + off, raw.begin() + off + n);
+        for (size_t i = 0; i < n; ++i) {  // n <= 65535: modulo once per block is safe with 64-bit
+            a += raw[off + i];
+            b += a;
+        }
+        a %= 65521u;
+        b %= 65521u;
+        off += n;
+    } while (off < rawSize);
+    PushBE32(z, static_cast<uint32_t>((b << 16) | a));
+    PushChunk(file, "IDAT", z);
+    PushChunk(file, "IEND", {});
     FILE* f = nullptr;
     if (fopen_s(&f, path.c_str(), "wb") != 0 || !f) throw ToolError("cannot write '" + path + "'");
     fwrite(file.data(), 1, file.size(), f);
